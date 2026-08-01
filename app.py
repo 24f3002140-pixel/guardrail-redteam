@@ -195,34 +195,27 @@ def validate_url(raw_url: str) -> str:
 
 
 def fetch_allowlisted_url(raw_url: str) -> str:
-    current_url = validate_url(raw_url)
+    safe_url = validate_url(raw_url)
 
     session = requests.Session()
     session.trust_env = False
 
-    for _ in range(MAX_REDIRECTS + 1):
-        response = session.get(
-            current_url,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=False,
-            headers={"User-Agent": "agent-guardrail/2.0"},
-        )
+    response = session.get(
+        safe_url,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
+        headers={"User-Agent": "agent-guardrail/6.0"},
+    )
 
-        if response.is_redirect or response.is_permanent_redirect:
-            location = response.headers.get("Location")
-            if not location:
-                raise ValueError("redirect is missing Location header")
+    # Never follow redirects. This prevents an allowlisted public host from
+    # redirecting the request to localhost, metadata services, private IPs,
+    # lookalike domains, or any other non-allowlisted destination.
+    if 300 <= response.status_code < 400:
+        raise PermissionError("redirect responses are blocked")
 
-            next_url = urljoin(current_url, location)
-            current_url = validate_url(next_url)
-            continue
-
-        # Any HTTP status from an allowlisted, validated destination is still
-        # a successful tool execution. Do not block safe URLs merely because
-        # the remote server returned 4xx or 5xx.
-        return response.text
-
-    raise PermissionError("too many redirects")
+    # An HTTP 4xx/5xx response from a validated allowlisted host still means
+    # the permitted fetch actually ran, so return its body as an allowed result.
+    return response.text
 
 
 @app.get("/")
