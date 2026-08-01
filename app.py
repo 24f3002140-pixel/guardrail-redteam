@@ -6,6 +6,7 @@ import ipaddress
 import socket
 import httpx
 import re
+import dns.resolver
 
 app = FastAPI()
 
@@ -97,22 +98,38 @@ def forbidden_ip(ip_text: str) -> bool:
 
 def ensure_public_dns(host: str, port: int) -> None:
     try:
-        records = socket.getaddrinfo(
-            host,
-            port,
-            family=socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
-        )
-    except socket.gaierror as exc:
-        raise PermissionError(f"hostname resolution failed: {exc}")
-
-    addresses = {record[4][0] for record in records}
-    if not addresses:
-        raise PermissionError("hostname resolved to no addresses")
-
-    for address in addresses:
-        if forbidden_ip(address):
-            raise PermissionError("hostname resolves to a forbidden address")
+        # Use dnspython for more controlled resolution
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 5
+        resolver.lifetime = 5
+        
+        # Query both A and AAAA records
+        answers = []
+        try:
+            answers.extend(resolver.resolve(host, 'A'))
+        except:
+            pass
+        try:
+            answers.extend(resolver.resolve(host, 'AAAA'))
+        except:
+            pass
+        
+        if not answers:
+            raise PermissionError("hostname resolved to no addresses")
+            
+        for answer in answers:
+            ip_str = str(answer)
+            if forbidden_ip(ip_str):
+                raise PermissionError(f"hostname resolves to forbidden address: {ip_str}")
+                
+    except dns.resolver.NXDOMAIN:
+        raise PermissionError("hostname does not exist")
+    except dns.resolver.NoAnswer:
+        raise PermissionError("hostname has no A/AAAA records")
+    except dns.resolver.Timeout:
+        raise PermissionError("DNS resolution timeout")
+    except Exception as exc:
+        raise PermissionError(f"DNS resolution failed: {exc}")
 
 
 def contains_forbidden_target(raw_url: str) -> bool:
@@ -124,13 +141,31 @@ def contains_forbidden_target(raw_url: str) -> bool:
         parsed = urlsplit(raw_url)
         hostname = parsed.hostname
         if not hostname:
-            return False
+            return True  # Block if no hostname
         hostname = hostname.lower()
     except Exception:
-        return False
+        return True  # Block if parsing fails
     
-    # Check if the hostname itself is suspicious (not the path or query)
-    suspicious_hostnames = (
+    # Check for IP addresses in hostname
+    ip_match = re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", hostname)
+    if ip_match:
+        try:
+            if forbidden_ip(hostname):
+                return True
+        except ValueError:
+            return True
+    
+    # Check for IPv6 in hostname
+    if hostname.startswith('[') and hostname.endswith(']'):
+        try:
+            ip = ipaddress.ip_address(hostname[1:-1])
+            if not ip.is_global:
+                return True
+        except ValueError:
+            return True
+    
+    # Check for suspicious hostnames (exact match)
+    suspicious_hostnames = {
         "localhost",
         "metadata.google.internal",
         "metadata",
@@ -142,40 +177,65 @@ def contains_forbidden_target(raw_url: str) -> bool:
         "0x7f000001",
         "2130706433",
         "017700000001",
-    )
+        "instance-data",
+        "instance-data.ec2.internal",
+        "169.254.169.254",
+    }
     
     # Check exact hostname match
     if hostname in suspicious_hostnames:
         return True
     
-    # Check if hostname looks like an IP address
-    for candidate in re.findall(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])", hostname):
-        try:
-            if forbidden_ip(candidate):
-                return True
-        except ValueError:
+    # Check for hostnames that end with suspicious domains
+    for suspicious in suspicious_hostnames:
+        if hostname.endswith('.' + suspicious):
             return True
     
-    # Check for alternative IP notations in the hostname
-    for token in ("0x7f000001", "2130706433", "017700000001"):
-        if token in hostname:
-            return True
-    
-    # Check if the hostname resolves to a forbidden IP
-    # Only check if it's a hostname, not an IP already caught above
-    if not re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", hostname):
+    # Check for URL-encoded or alternative representations
+    # These can bypass hostname checks
+    if any(token in expanded for token in ["%2e", "%2E", "0x", "0X", "0177", "0169"]):
+        # If we see encoding, decode and check again
+        fully_decoded = unquote(expanded)
         try:
-            # Use socket.gethostbyname to resolve
-            resolved_ip = socket.gethostbyname(hostname)
-            if forbidden_ip(resolved_ip):
+            parsed2 = urlsplit(fully_decoded)
+            if parsed2.hostname and parsed2.hostname.lower() in suspicious_hostnames:
                 return True
-        except socket.gaierror:
-            pass  # If it doesn't resolve, it's not a valid hostname anyway
+        except:
+            pass
+    
+    # Check for DNS rebinding - resolve hostname now
+    if not ip_match and not hostname.startswith('['):
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = 3
+            resolver.lifetime = 3
+            
+            # Check A records
+            try:
+                answers = resolver.resolve(hostname, 'A')
+                for answer in answers:
+                    ip_str = str(answer)
+                    if forbidden_ip(ip_str):
+                        return True
+            except:
+                pass
+                
+            # Check AAAA records
+            try:
+                answers = resolver.resolve(hostname, 'AAAA')
+                for answer in answers:
+                    ip_str = str(answer)
+                    if forbidden_ip(ip_str):
+                        return True
+            except:
+                pass
+        except:
+            pass
     
     return False
 
 
-def validate_url(raw_url: str) -> str:
+def validate_url(raw_url: str, is_redirect: bool = False) -> str:
     if not isinstance(raw_url, str) or not raw_url:
         raise ValueError("url must be a non-empty string")
 
@@ -206,6 +266,18 @@ def validate_url(raw_url: str) -> str:
 
     host = parsed.hostname.lower()
 
+    # For redirects, we need to re-validate the final host
+    if is_redirect:
+        # Re-check host against allowlist
+        if host not in ALLOWED_HOSTS:
+            raise PermissionError("redirect hostname is not allowlisted")
+        
+        # Re-check DNS resolution
+        try:
+            ensure_public_dns(host, 443 if scheme == "https" else 80)
+        except PermissionError as exc:
+            raise PermissionError(f"redirect DNS validation failed: {exc}")
+    
     # Exact hostname match only: no subdomains, lookalikes or trailing dot.
     if host not in ALLOWED_HOSTS:
         raise PermissionError("hostname is not allowlisted")
@@ -227,44 +299,60 @@ def validate_url(raw_url: str) -> str:
     except ValueError as exc:
         raise PermissionError("invalid port") from exc
 
-    port = 443 if scheme == "https" else 80
-    
     # Check for forbidden targets BEFORE DNS resolution
     if contains_forbidden_target(raw_url):
         raise PermissionError("URL contains a forbidden destination")
     
-    # DNS resolution happens here
-    ensure_public_dns(host, port)
+    # DNS resolution happens here for the initial request
+    if not is_redirect:
+        port = 443 if scheme == "https" else 80
+        ensure_public_dns(host, port)
 
     # Keep the validated original path/query. Authority is already exact.
     return raw_url
 
 
 def fetch_url(raw_url: str) -> str:
-    current = validate_url(raw_url)
+    current = validate_url(raw_url, is_redirect=False)
 
     with httpx.Client(
         follow_redirects=False,
         trust_env=False,
         timeout=TIMEOUT_SECONDS,
-        headers={"User-Agent": "agent-guardrail-final/1.0"},
+        headers={
+            "User-Agent": "agent-guardrail-final/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        },
+        max_redirects=0,  # We handle redirects manually
     ) as client:
-        for _ in range(MAX_REDIRECTS + 1):
-            response = client.get(current)
-
+        for redirect_count in range(MAX_REDIRECTS + 1):
+            # Make the request
+            response = client.get(current, follow_redirects=False)
+            
+            # Check for redirect status codes
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("location")
                 if not location:
                     raise PermissionError("redirect has no Location header")
-
+                
+                # Resolve relative redirects
                 target = urljoin(current, location)
-                current = validate_url(target)
+                
+                # Re-validate the redirect target with is_redirect=True
+                try:
+                    current = validate_url(target, is_redirect=True)
+                except (ValueError, PermissionError) as exc:
+                    # Check if the redirect location itself is suspicious
+                    # Some attacks use redirects to internal IPs
+                    raise PermissionError(f"redirect validation failed: {exc}")
+                
                 continue
-
+            
+            # If it's a 3xx but not a recognized redirect, block it
             if 300 <= response.status_code < 400:
                 raise PermissionError("unsupported redirect response")
-
-            # A validated fetch is allowed regardless of remote HTTP status.
+            
+            # If we got here, it's a final response (2xx, 4xx, 5xx)
             return response.text
 
     raise PermissionError("too many redirects")
