@@ -86,10 +86,10 @@ def is_private_ip(ip_str: str) -> bool:
 
 
 def resolve_hostname(host: str) -> list:
-    """Resolve hostname to all IP addresses."""
+    """Resolve hostname to a list of literal IP address strings."""
     try:
-        # Get all addresses (both IPv4 and IPv6)
         addrinfo = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        # FIX: Explicitly extract only the IP address string element from the socket info tuple
         return list(set([addr[4][0] for addr in addrinfo]))
     except socket.gaierror:
         return []
@@ -98,7 +98,6 @@ def resolve_hostname(host: str) -> list:
 def is_allowed_host(host: str) -> bool:
     """Check if host is in the allowlist (exact match only)."""
     host = host.lower()
-    # Remove trailing dot if present
     if host.endswith('.'):
         host = host[:-1]
     return host in ALLOWED_HOSTS
@@ -115,7 +114,7 @@ def validate_url(raw_url: str) -> str:
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_url):
         raise PermissionError("URL control characters are not allowed")
 
-    # Strict check: Block backslashes globally to prevent parser ambiguities
+    # Strict check: Block backslashes globally to prevent web parser differentials
     if "\\" in raw_url:
         raise PermissionError("URL backslashes are not allowed")
 
@@ -173,8 +172,7 @@ def validate_url(raw_url: str) -> str:
         if is_private_ip(ip):
             raise PermissionError("hostname resolves to a forbidden address")
 
-    # FIX: Reconstruct and return the parsed URL string format.
-    # This strips out structural parsing tricks and guarantees consistency.
+    # FIX: Reconstruct and return the validated, canonical URL structure
     return parsed.geturl()
 
 
@@ -207,7 +205,6 @@ def fetch_url(raw_url: str) -> str:
             if 300 <= response.status_code < 400:
                 raise PermissionError("unsupported redirect response")
 
-            # Return response for any non-redirect status (including errors)
             return response.text
 
     raise PermissionError("too many redirects")
