@@ -98,14 +98,8 @@ def read_virtual_file(raw_path: str) -> str:
 def is_forbidden_ip(ip_text: str) -> bool:
     ip = ipaddress.ip_address(ip_text.split("%", 1)[0])
 
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
+    # Permit only globally routable public addresses.
+    return not ip.is_global
 
 
 def resolve_public_addresses(hostname: str, port: int) -> list[str]:
@@ -195,27 +189,43 @@ def validate_url(raw_url: str) -> str:
 
 
 def fetch_allowlisted_url(raw_url: str) -> str:
-    safe_url = validate_url(raw_url)
+    current_url = validate_url(raw_url)
+    original_host = urlsplit(current_url).hostname
 
     session = requests.Session()
     session.trust_env = False
 
-    response = session.get(
-        safe_url,
-        timeout=REQUEST_TIMEOUT,
-        allow_redirects=False,
-        headers={"User-Agent": "agent-guardrail/6.0"},
-    )
+    for _ in range(MAX_REDIRECTS + 1):
+        response = session.get(
+            current_url,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
+            headers={"User-Agent": "agent-guardrail/7.0"},
+        )
 
-    # Never follow redirects. This prevents an allowlisted public host from
-    # redirecting the request to localhost, metadata services, private IPs,
-    # lookalike domains, or any other non-allowlisted destination.
-    if 300 <= response.status_code < 400:
-        raise PermissionError("redirect responses are blocked")
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location")
+            if not location:
+                raise PermissionError("redirect missing Location header")
 
-    # An HTTP 4xx/5xx response from a validated allowlisted host still means
-    # the permitted fetch actually ran, so return its body as an allowed result.
-    return response.text
+            candidate = urljoin(current_url, location)
+            next_url = validate_url(candidate)
+            next_host = urlsplit(next_url).hostname
+
+            # Safe redirects may change http to https, but cannot change host.
+            if next_host != original_host:
+                raise PermissionError("cross-host redirect is blocked")
+
+            current_url = next_url
+            continue
+
+        if 300 <= response.status_code < 400:
+            raise PermissionError("unsupported redirect response is blocked")
+
+        # 4xx/5xx from a validated destination still means the permitted fetch ran.
+        return response.text
+
+    raise PermissionError("too many redirects")
 
 
 @app.get("/")
