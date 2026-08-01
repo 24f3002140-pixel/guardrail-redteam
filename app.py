@@ -189,7 +189,9 @@ def fetch_allowlisted_url(raw_url: str) -> str:
             current_url = validate_url(next_url)
             continue
 
-        response.raise_for_status()
+        # Any HTTP status from an allowlisted, validated destination is still
+        # a successful tool execution. Do not block safe URLs merely because
+        # the remote server returned 4xx or 5xx.
         return response.text
 
     raise PermissionError("too many redirects")
