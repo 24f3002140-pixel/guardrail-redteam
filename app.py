@@ -115,6 +115,7 @@ def validate_url(raw_url: str) -> str:
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_url):
         raise PermissionError("URL control characters are not allowed")
 
+    # Strict check: Block backslashes globally to prevent parser ambiguities
     if "\\" in raw_url:
         raise PermissionError("URL backslashes are not allowed")
 
@@ -141,8 +142,6 @@ def validate_url(raw_url: str) -> str:
     # Remove trailing dot if present
     if host.endswith('.'):
         host = host[:-1]
-        # Reconstruct URL without trailing dot
-        raw_url = raw_url.rstrip('.')
 
     # Block encoded authority
     if "%" in parsed.netloc:
@@ -174,8 +173,9 @@ def validate_url(raw_url: str) -> str:
         if is_private_ip(ip):
             raise PermissionError("hostname resolves to a forbidden address")
 
-    # Return the validated URL (with any normalization applied)
-    return raw_url
+    # FIX: Reconstruct and return the parsed URL string format.
+    # This strips out structural parsing tricks and guarantees consistency.
+    return parsed.geturl()
 
 
 def fetch_url(raw_url: str) -> str:
