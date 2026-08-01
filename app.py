@@ -88,17 +88,23 @@ def decode_repeatedly(value: str, rounds: int = 3) -> str:
 
 
 def forbidden_ip(ip_text: str) -> bool:
-    ip = ipaddress.ip_address(ip_text.split("%", 1)[0])
-    return not ip.is_global
+    try:
+        ip = ipaddress.ip_address(ip_text.split("%", 1)[0])
+        return not ip.is_global
+    except ValueError:
+        return True
 
 
 def ensure_public_dns(host: str, port: int) -> None:
-    records = socket.getaddrinfo(
-        host,
-        port,
-        family=socket.AF_UNSPEC,
-        type=socket.SOCK_STREAM,
-    )
+    try:
+        records = socket.getaddrinfo(
+            host,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise PermissionError(f"hostname resolution failed: {exc}")
 
     addresses = {record[4][0] for record in records}
     if not addresses:
@@ -110,35 +116,63 @@ def ensure_public_dns(host: str, port: int) -> None:
 
 
 def contains_forbidden_target(raw_url: str) -> bool:
-    # Catch private/metadata targets hidden in path/query or percent encoding.
+    # Only decode the URL for analysis, but keep the original for other checks
     expanded = decode_repeatedly(raw_url).lower()
-
-    suspicious_names = (
+    
+    # Extract the hostname from the URL to avoid scanning path/query for hostnames
+    try:
+        parsed = urlsplit(raw_url)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        hostname = hostname.lower()
+    except Exception:
+        return False
+    
+    # Check if the hostname itself is suspicious (not the path or query)
+    suspicious_hostnames = (
         "localhost",
         "metadata.google.internal",
         "metadata",
+        "169.254.169.254",
+        "0.0.0.0",
+        "127.0.0.1",
+        "::1",
+        "[::1]",
+        "0x7f000001",
+        "2130706433",
+        "017700000001",
     )
-    if any(name in expanded for name in suspicious_names):
+    
+    # Check exact hostname match
+    if hostname in suspicious_hostnames:
         return True
-
-    # Extract IPv4-looking values from the entire decoded URL.
-    for candidate in re.findall(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])", expanded):
+    
+    # Check if hostname looks like an IP address
+    for candidate in re.findall(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])", hostname):
         try:
             if forbidden_ip(candidate):
                 return True
         except ValueError:
             return True
-
-    # Common alternative loopback/metadata notations.
-    suspicious_tokens = (
-        "0x7f000001",
-        "2130706433",
-        "017700000001",
-        "169.254.169.254",
-        "[::1]",
-        "::1",
-    )
-    return any(token in expanded for token in suspicious_tokens)
+    
+    # Check for alternative IP notations in the hostname
+    for token in ("0x7f000001", "2130706433", "017700000001"):
+        if token in hostname:
+            return True
+    
+    # Check if the hostname resolves to a forbidden IP
+    # Only check if it's a hostname, not an IP already caught above
+    if not re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", hostname):
+        try:
+            # Use socket.gethostbyname to resolve
+            resolved_ip = socket.gethostbyname(hostname)
+            if forbidden_ip(resolved_ip):
+                return True
+        except socket.gaierror:
+            pass  # If it doesn't resolve, it's not a valid hostname anyway
+    
+    return False
 
 
 def validate_url(raw_url: str) -> str:
@@ -154,11 +188,9 @@ def validate_url(raw_url: str) -> str:
     if "\\" in raw_url:
         raise PermissionError("URL backslashes are not allowed")
 
-    if contains_forbidden_target(raw_url):
-        raise PermissionError("URL contains a forbidden destination")
-
+    # Parse URL first to check hostname
     parsed = urlsplit(raw_url)
-
+    
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https"}:
         raise PermissionError("only HTTP and HTTPS are allowed")
@@ -196,6 +228,12 @@ def validate_url(raw_url: str) -> str:
         raise PermissionError("invalid port") from exc
 
     port = 443 if scheme == "https" else 80
+    
+    # Check for forbidden targets BEFORE DNS resolution
+    if contains_forbidden_target(raw_url):
+        raise PermissionError("URL contains a forbidden destination")
+    
+    # DNS resolution happens here
     ensure_public_dns(host, port)
 
     # Keep the validated original path/query. Authority is already exact.
