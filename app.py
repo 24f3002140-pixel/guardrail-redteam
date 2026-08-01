@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from pathlib import PurePosixPath
-from urllib.parse import urlsplit, urljoin
+from urllib.parse import urlsplit, urljoin, urlunsplit
 import ipaddress
 import socket
 import requests
@@ -135,21 +135,23 @@ def validate_url(raw_url: str) -> str:
     if not isinstance(raw_url, str) or not raw_url:
         raise ValueError("url must be a non-empty string")
 
-    # Reject common URL parser-confusion characters and hidden whitespace.
     if raw_url != raw_url.strip():
-        raise PermissionError("leading or trailing whitespace is not allowed")
+        raise PermissionError("whitespace is not allowed")
 
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_url):
         raise PermissionError("control characters are not allowed")
 
     if "\\" in raw_url:
-        raise PermissionError("backslashes are not allowed in URLs")
+        raise PermissionError("backslashes are not allowed")
 
     parsed = urlsplit(raw_url)
 
     scheme = parsed.scheme.lower()
     if scheme not in ALLOWED_SCHEMES:
         raise PermissionError("only http and https are allowed")
+
+    if parsed.fragment:
+        raise PermissionError("URL fragments are not allowed")
 
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         raise PermissionError("URL userinfo is not allowed")
@@ -159,11 +161,14 @@ def validate_url(raw_url: str) -> str:
 
     hostname = parsed.hostname.lower()
 
-    # The policy requires exact hostnames. A trailing dot is therefore blocked.
     if hostname not in ALLOWED_HOSTS:
         raise PermissionError("hostname is not allowlisted")
 
-    # Percent-encoding and non-ASCII text are forbidden in the authority section.
+    # Exact-host policy: no trailing dot, encoded authority, Unicode authority,
+    # IPv6 brackets, or explicit port.
+    if parsed.netloc.lower() != hostname:
+        raise PermissionError("URL authority must be the exact allowlisted hostname")
+
     if "%" in parsed.netloc:
         raise PermissionError("encoded authority is not allowed")
 
@@ -173,23 +178,20 @@ def validate_url(raw_url: str) -> str:
         raise PermissionError("non-ASCII authority is not allowed") from exc
 
     try:
-        port = parsed.port
+        explicit_port = parsed.port
     except ValueError as exc:
         raise ValueError("invalid URL port") from exc
 
-    default_port = 443 if scheme == "https" else 80
-    effective_port = default_port if port is None else port
+    if explicit_port is not None:
+        raise PermissionError("explicit ports are not allowed")
 
-    if effective_port not in (80, 443):
-        raise PermissionError("only ports 80 and 443 are allowed")
+    port = 443 if scheme == "https" else 80
+    resolve_public_addresses(hostname, port)
 
-    # Ensure the authority is exactly host or host:80/443—nothing parser-confusing.
-    expected_netlocs = {hostname, f"{hostname}:80", f"{hostname}:443"}
-    if parsed.netloc.lower() not in expected_netlocs:
-        raise PermissionError("URL authority is not an exact allowlisted host")
+    path = parsed.path or "/"
 
-    resolve_public_addresses(hostname, effective_port)
-    return raw_url
+    # Reconstruct a canonical URL so requests never receives an ambiguous form.
+    return urlunsplit((scheme, hostname, path, parsed.query, ""))
 
 
 def fetch_allowlisted_url(raw_url: str) -> str:
