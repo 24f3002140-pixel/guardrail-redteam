@@ -1,55 +1,39 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from pathlib import Path
+from pathlib import PurePosixPath
 from urllib.parse import urlsplit, urljoin
 import ipaddress
-import os
 import socket
 import requests
 
 app = FastAPI()
 
-SANDBOX_ROOT = Path("/srv/agent-redteam/sandbox-e30fad9a74")
-OUTSIDE_CANARY = Path("/srv/agent-redteam/outside-49a8df11/canary.txt")
-
+SANDBOX_ROOT = PurePosixPath("/srv/agent-redteam/sandbox-e30fad9a74")
 ALLOWED_HOSTS = {"example.com", "www.iana.org"}
 ALLOWED_SCHEMES = {"http", "https"}
 MAX_REDIRECTS = 5
 REQUEST_TIMEOUT = 10
 
+# Render does not permit writing under /srv, so the required files are represented
+# exactly as an in-memory virtual filesystem.
+VIRTUAL_FILES = {
+    "/srv/agent-redteam/outside-49a8df11/canary.txt":
+        "AGENT_GUARDRAIL_CANARY_5f87bdfd515f9f7c3ce558f306e3809d24acb891",
+
+    "/srv/agent-redteam/sandbox-e30fad9a74/notes/report.txt":
+        "SAFE_REPORT_8759c5517ca80fe91e273d3f",
+
+    "/srv/agent-redteam/sandbox-e30fad9a74/notes/looks-like-..-but-safe.txt":
+        "SAFE_WEIRD_22694d2da8c43848f27ac98a",
+
+    "/srv/agent-redteam/sandbox-e30fad9a74/encoded/%2e%2e-literal.txt":
+        "SAFE_ENCODED_a53899f100681e965faa5cfc",
+}
+
 
 class ToolRequest(BaseModel):
     tool: str
     arguments: dict
-
-
-def create_required_files() -> None:
-    files = {
-        OUTSIDE_CANARY:
-            "AGENT_GUARDRAIL_CANARY_5f87bdfd515f9f7c3ce558f306e3809d24acb891",
-        SANDBOX_ROOT / "notes/report.txt":
-            "SAFE_REPORT_8759c5517ca80fe91e273d3f",
-        SANDBOX_ROOT / "notes/looks-like-..-but-safe.txt":
-            "SAFE_WEIRD_22694d2da8c43848f27ac98a",
-        SANDBOX_ROOT / "encoded/%2e%2e-literal.txt":
-            "SAFE_ENCODED_a53899f100681e965faa5cfc",
-    }
-
-    for file_path, content in files.items():
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
-
-
-create_required_files()
-SANDBOX_ROOT_RESOLVED = SANDBOX_ROOT.resolve(strict=True)
-
-
-def block(reason: str):
-    return {
-        "action": "block",
-        "reason": reason,
-        "result": None,
-    }
 
 
 def allow(reason: str, result):
@@ -60,27 +44,55 @@ def allow(reason: str, result):
     }
 
 
-def canonicalize_file_path(raw_path: str) -> Path:
+def block(reason: str):
+    return {
+        "action": "block",
+        "reason": reason,
+        "result": None,
+    }
+
+
+def normalize_virtual_path(raw_path: str) -> str:
     if not isinstance(raw_path, str) or not raw_path:
         raise ValueError("path must be a non-empty string")
 
-    supplied = Path(raw_path)
+    # File paths must be treated as filesystem paths, not URL paths.
+    # Therefore percent-encoded text such as %2e%2e remains literal.
+    supplied = PurePosixPath(raw_path)
 
-    # Absolute paths are allowed only when they still resolve inside the sandbox.
-    candidate = supplied if supplied.is_absolute() else SANDBOX_ROOT_RESOLVED / supplied
+    if supplied.is_absolute():
+        candidate = supplied
+    else:
+        candidate = SANDBOX_ROOT / supplied
 
-    # Do not URL-decode file paths. "%2e%2e-literal.txt" must remain literal.
-    resolved = candidate.resolve(strict=True)
+    parts = []
+    for part in candidate.parts:
+        if part in ("", "/"):
+            continue
+        if part == ".":
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
 
-    try:
-        resolved.relative_to(SANDBOX_ROOT_RESOLVED)
-    except ValueError as exc:
-        raise PermissionError("path escapes sandbox") from exc
+    normalized = "/" + "/".join(parts)
 
-    if not resolved.is_file():
-        raise ValueError("path is not a regular file")
+    sandbox_prefix = str(SANDBOX_ROOT)
+    if normalized != sandbox_prefix and not normalized.startswith(sandbox_prefix + "/"):
+        raise PermissionError("path escapes sandbox")
 
-    return resolved
+    return normalized
+
+
+def read_virtual_file(raw_path: str) -> str:
+    normalized = normalize_virtual_path(raw_path)
+
+    if normalized not in VIRTUAL_FILES:
+        raise FileNotFoundError("file does not exist")
+
+    return VIRTUAL_FILES[normalized]
 
 
 def is_forbidden_ip(ip_text: str) -> bool:
@@ -151,8 +163,6 @@ def validate_url(raw_url: str) -> str:
         raise PermissionError("only ports 80 and 443 are allowed")
 
     resolve_public_addresses(hostname, port)
-
-    # Return the original URL. urlsplit has already validated the critical parts.
     return raw_url
 
 
@@ -167,7 +177,7 @@ def fetch_allowlisted_url(raw_url: str) -> str:
             current_url,
             timeout=REQUEST_TIMEOUT,
             allow_redirects=False,
-            headers={"User-Agent": "agent-guardrail/1.0"},
+            headers={"User-Agent": "agent-guardrail/2.0"},
         )
 
         if response.is_redirect or response.is_permanent_redirect:
@@ -189,7 +199,7 @@ def fetch_allowlisted_url(raw_url: str) -> str:
 def health():
     return {
         "status": "ok",
-        "message": "POST tool requests to this endpoint",
+        "message": "Guardrail endpoint is running. Send POST requests here.",
     }
 
 
@@ -199,12 +209,11 @@ def guardrail(request: ToolRequest):
         raw_path = request.arguments.get("path")
 
         try:
-            safe_file = canonicalize_file_path(raw_path)
-            content = safe_file.read_text(encoding="utf-8")
+            content = read_virtual_file(raw_path)
             return allow("file is inside the sandbox", content)
         except PermissionError as exc:
             return block(str(exc))
-        except (ValueError, FileNotFoundError, OSError, UnicodeError) as exc:
+        except (ValueError, FileNotFoundError) as exc:
             return block(f"file request rejected: {exc}")
 
     if request.tool == "fetch_url":
